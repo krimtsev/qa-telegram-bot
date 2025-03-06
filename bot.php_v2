@@ -1,0 +1,371 @@
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+/**
+ * 1. Константы и пути
+ */
+define('BOT_TOKEN', '7789434677:AAGBzS8GY6B6vTDb-6W-1BbDeaXCKRpN1pw');
+define('API_URL', 'https://api.telegram.org/bot' . BOT_TOKEN . '/');
+
+// ID канала, куда отправляем файл с результатами
+define('CHANNEL_CHAT_ID', '-1002414171386');
+
+// Путь к файлу с вопросами
+define('QA_FILE', 'qa.json');
+
+// Папки для хранения сессий и итоговых ответов
+define('SESSION_DIR', 'sessions');
+define('ANSWER_DIR', 'answer');
+
+// Создаём директории, если их нет
+if (!is_dir(SESSION_DIR)) {
+    mkdir(SESSION_DIR, 0777, true);
+}
+if (!is_dir(ANSWER_DIR)) {
+    mkdir(ANSWER_DIR, 0777, true);
+}
+
+/**
+ * 2. Функции отправки сообщений и документов
+ */
+function sendMessage($chat_id, $text, $reply_markup = null) {
+    $data = [
+        'chat_id' => $chat_id,
+        'text' => $text,
+        'parse_mode' => 'HTML'
+    ];
+    if ($reply_markup) {
+        $data['reply_markup'] = json_encode($reply_markup);
+    }
+    file_get_contents(API_URL . "sendMessage?" . http_build_query($data));
+}
+
+function sendDocument($chat_id, $document_path, $caption = null) {
+    $data = [
+        'chat_id' => $chat_id,
+        'caption' => $caption
+    ];
+    $file = new CURLFile(realpath($document_path));
+    $data['document'] = $file;
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, API_URL . "sendDocument");
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    $output = curl_exec($ch);
+    curl_close($ch);
+    return $output;
+}
+
+/**
+ * 3. Работа с сессиями (файлы sessions/<chat_id>.json)
+ */
+function getSessionFile($chat_id) {
+    return SESSION_DIR . '/' . $chat_id . '.json';
+}
+
+function loadSession($chat_id) {
+    $file = getSessionFile($chat_id);
+    if (file_exists($file)) {
+        $data = json_decode(file_get_contents($file), true);
+        if ($data) {
+            return $data;
+        }
+    }
+    return null;
+}
+
+function saveSession($chat_id, $data) {
+    $file = getSessionFile($chat_id);
+    file_put_contents($file, json_encode($data));
+}
+
+/**
+ * 4. Загрузка и разбор вопросов из qa.json
+ *    - Если в тексте варианта есть "[правильный]", мы:
+ *      1) Удаляем эту метку из текста для пользователя
+ *      2) Запоминаем индекс как "правильный"
+ */
+function loadQuestions() {
+    if (!file_exists(QA_FILE)) {
+        return [];
+    }
+    $json = file_get_contents(QA_FILE);
+    $rawQuestions = json_decode($json, true);
+    if (!is_array($rawQuestions)) {
+        return [];
+    }
+    $questions = [];
+    foreach ($rawQuestions as $q) {
+        $questionText = isset($q['question']) ? $q['question'] : '';
+        $type = isset($q['type']) ? $q['type'] : 'inline';
+        $rawOptions = isset($q['options']) && is_array($q['options']) ? $q['options'] : [];
+        
+        $options = [];
+        $correctIndexes = [];
+        
+        foreach ($rawOptions as $idx => $opt) {
+            // Если вариант содержит "[правильный]", это значит правильный ответ
+            if (strpos($opt, '[правильный]') !== false) {
+                $correctIndexes[] = $idx;
+            }
+            // Удаляем метку "[правильный]" из текста, чтобы пользователь её не видел
+            $cleanOption = str_replace('[правильный]', '', $opt);
+            $options[] = trim($cleanOption);
+        }
+        
+        $questions[] = [
+            'question' => $questionText,
+            'type' => $type,
+            'options' => $options,
+            'correct_indexes' => $correctIndexes
+        ];
+    }
+    return $questions;
+}
+
+/**
+ * 5. Отправка текущего вопроса
+ *    - Показываем вопрос и все варианты (очищенные от "[правильный]")
+ *    - Inline-кнопки только с цифрами "1", "2", "3"...
+ */
+function sendCurrentQuestion(&$session) {
+    $questions = loadQuestions();
+    $index = $session['current_question'];
+    
+    if ($index >= count($questions)) {
+        completeSurvey($session);
+        return;
+    }
+    
+    $q = $questions[$index];
+    $chat_id = $session['chat_id'];
+    
+    // Текст вопроса + перечислим варианты
+    $text = "<b>Вопрос " . ($index + 1) . ":</b> " . $q['question'] . "\n\n";
+    foreach ($q['options'] as $idx => $optionText) {
+        $text .= ($idx + 1) . ") " . $optionText . "\n";
+    }
+    
+    // Inline-кнопки с цифрами
+    $keyboard = ['inline_keyboard' => []];
+    foreach ($q['options'] as $idx => $optionText) {
+        $buttonLabel = (string)($idx + 1);
+        $keyboard['inline_keyboard'][] = [
+            ['text' => $buttonLabel, 'callback_data' => $buttonLabel]
+        ];
+    }
+    
+    sendMessage($chat_id, $text, $keyboard);
+}
+
+/**
+ * 6. Завершение опроса
+ *    - Подсчёт баллов: за каждый правильный ответ +2.5
+ *    - В итоговом файле вместо цифры показываем выбранный вариант 
+ *      и дописываем [правильный] или [не правильный]
+ */
+function completeSurvey(&$session) {
+    $chat_id = $session['chat_id'];
+    $name   = isset($session['name']) ? $session['name'] : '';
+    $branch = isset($session['branch']) ? $session['branch'] : '';
+    $answers = isset($session['answers']) ? $session['answers'] : [];
+    
+    // Загружаем вопросы для подсчёта
+    $questions = loadQuestions();
+    
+    // Подсчитываем баллы
+    $score = 0.0;
+    $content = "Имя: $name\nФилиал: $branch\n\n";
+    
+    foreach ($questions as $i => $q) {
+        $q_num = $i + 1;
+        $content .= "Вопрос $q_num: " . $q['question'] . "\n";
+        
+        // Узнаём, что ответил пользователь
+        if (!isset($answers[$i])) {
+            $content .= "Ответ: Нет ответа\n\n";
+            continue;
+        }
+        
+        // userChoice – строка "1", "2", "3"...
+        $userChoice = $answers[$i];
+        $userIndex = intval($userChoice) - 1;
+        
+        // Проверяем, не вышли ли за границы
+        if (!isset($q['options'][$userIndex])) {
+            $content .= "Ответ: Неизвестный вариант\n\n";
+            continue;
+        }
+        
+        $pickedOptionText = $q['options'][$userIndex];
+        
+        // Проверяем, правильный ли это вариант
+        if (in_array($userIndex, $q['correct_indexes'], true)) {
+            $score += 2.5;
+            $mark = "[правильный]";
+        } else {
+            $mark = "[не правильный]";
+        }
+        
+        // Выводим вариант + пометку
+        $content .= "Ответ: " . $pickedOptionText . " " . $mark . "\n\n";
+    }
+    
+    // Округлим балл
+    $scoreFmtRaw = number_format($score, 1, '.', '');
+    $scoreFmt = rtrim(rtrim($scoreFmtRaw, '0'), '.');
+    
+    // Формируем имя файла
+    $branchSafe = preg_replace('/[^а-яА-Яa-zA-Z0-9\s]/u', '_', $branch);
+    $nameSafe   = preg_replace('/[^а-яА-Яa-zA-Z0-9\s]/u', '_', $name);
+    $branchSafe = preg_replace('/\s+/', '_', $branchSafe);
+    $nameSafe   = preg_replace('/\s+/', '_', $nameSafe);
+    
+    $file_name = $scoreFmt . "_" . $branchSafe . "_" . $nameSafe . ".txt";
+    $file_path = ANSWER_DIR . '/' . $file_name;
+    
+    file_put_contents($file_path, $content);
+    
+    // Ставим метку, что пользователь завершил опрос
+    $session['completed'] = true;
+    saveSession($chat_id, $session);
+    
+    // Сообщаем пользователю
+    sendMessage($chat_id, "Опрос завершён. Спасибо за участие! Вы набрали $scoreFmt баллов.");
+    
+    // Отправляем файл в канал
+    $caption = "Новые ответы от $name ($branch). Итог: $scoreFmt баллов";
+    sendDocument(CHANNEL_CHAT_ID, $file_path, $caption);
+}
+
+/**
+ * 7. Основная логика: получаем update и обрабатываем
+ */
+$update = json_decode(file_get_contents('php://input'), true);
+if (!$update) {
+    exit;
+}
+
+// 7.1. Обработка inline-кнопок (callback_query)
+if (isset($update['callback_query'])) {
+    $callback = $update['callback_query'];
+    $chat_id = $callback['message']['chat']['id'];
+    $data = $callback['data']; // "1", "2", "3" и т.д.
+    
+    $session = loadSession($chat_id);
+    if (!$session) {
+        sendMessage($chat_id, "Пожалуйста, начните опрос командой /start");
+        exit;
+    }
+
+    // Если опрос уже завершён, игнорируем повторные нажатия (предотвращаем дубли)
+    if (!empty($session['completed'])) {
+        exit;
+    }
+    
+    // Записываем ответ для текущего вопроса
+    $currentIndex = $session['current_question'];
+    $session['answers'][$currentIndex] = $data;
+    $session['current_question']++;
+    saveSession($chat_id, $session);
+    
+    // Переходим к следующему вопросу
+    sendCurrentQuestion($session);
+    exit;
+}
+
+// 7.2. Обработка обычных сообщений
+if (isset($update['message'])) {
+    $message = $update['message'];
+    $chat_id = $message['chat']['id'];
+    $text = trim($message['text']);
+    
+    // Загрузим сессию
+    $session = loadSession($chat_id);
+
+    // Команда /start
+    if ($text === '/start') {
+        // Если уже завершил
+        if ($session && !empty($session['completed'])) {
+            sendMessage($chat_id, "Вы уже прошли опрос. Новых опросов на данный момент нет.");
+            exit;
+        }
+        // Начинаем новую сессию
+        $session = [
+            'chat_id' => $chat_id,
+            'state' => 'collect_name',
+            'current_question' => 0,
+            'answers' => []
+        ];
+        saveSession($chat_id, $session);
+        sendMessage($chat_id, "Здравствуйте! Для начала, пожалуйста, введите ваше имя:");
+        exit;
+    }
+    
+    // Команда /reset – сброс
+    if ($text === '/reset') {
+        if ($session) {
+            // Удаляем файл сессии
+            $sessionFile = getSessionFile($chat_id);
+            if (file_exists($sessionFile)) {
+                unlink($sessionFile);
+            }
+            // Удаляем файл с ответами, если уже был создан
+            if (!empty($session['completed']) && !empty($session['name']) && !empty($session['branch'])) {
+                $branchSafe = preg_replace('/[^а-яА-Яa-zA-Z0-9\s]/u', '_', $session['branch']);
+                $nameSafe   = preg_replace('/[^а-яА-Яa-zA-Z0-9\s]/u', '_', $session['name']);
+                $branchSafe = preg_replace('/\s+/', '_', $branchSafe);
+                $nameSafe   = preg_replace('/\s+/', '_', $nameSafe);
+                
+                // Удаляем любой файл, где есть эти поля (балл может отличаться)
+                foreach (glob(ANSWER_DIR . '/*.txt') as $f) {
+                    if (strpos($f, $branchSafe) !== false && strpos($f, $nameSafe) !== false) {
+                        unlink($f);
+                    }
+                }
+            }
+            sendMessage($chat_id, "Ваши данные сброшены. Введите /start для начала опроса заново.");
+        } else {
+            sendMessage($chat_id, "У вас нет активных данных. Введите /start для начала опроса.");
+        }
+        exit;
+    }
+    
+    // Если сессии нет, просим начать
+    if (!$session) {
+        sendMessage($chat_id, "Пожалуйста, начните опрос командой /start");
+        exit;
+    }
+    
+    // Обработка состояний (сбор имени, филиала)
+    if ($session['state'] === 'collect_name') {
+        $session['name'] = $text;
+        $session['state'] = 'collect_branch';
+        saveSession($chat_id, $session);
+        sendMessage($chat_id, "Спасибо, {$text}. Теперь укажите ваш филиал:");
+        exit;
+    }
+    
+    if ($session['state'] === 'collect_branch') {
+        $session['branch'] = $text;
+        $session['state'] = 'in_progress';
+        saveSession($chat_id, $session);
+        // Начинаем опрос
+        sendCurrentQuestion($session);
+        exit;
+    }
+    
+    // Если мы уже в процессе (in_progress), но пользователь отправил текст
+    // Предполагаем, что всё через inline-кнопки, поэтому напоминаем нажать кнопку
+    if ($session['state'] === 'in_progress') {
+        sendMessage($chat_id, "Пожалуйста, выберите один из вариантов, нажав на соответствующую кнопку.");
+        exit;
+    }
+    
+    // Если ни одно условие не сработало
+    sendMessage($chat_id, "Неизвестная команда. Используйте /start для начала или /reset для сброса данных.");
+}
+?>
