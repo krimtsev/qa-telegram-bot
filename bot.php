@@ -5,7 +5,7 @@ ini_set('display_errors', 1);
 /**
  * 1. Константы и пути
  */
-define('BOT_TOKEN', '7789434677:AAGBzS8GY6B6vTDb-6W-1BbDeaXCKRpN1pw');
+define('BOT_TOKEN', 'BOT_TOKEN');
 define('API_URL', 'https://api.telegram.org/bot' . BOT_TOKEN . '/');
 
 // ID канала, куда отправляем файл с результатами
